@@ -1,0 +1,174 @@
+name: Build ffsubsync GUI AppImage
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04  # Old enough for compatibility
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Setup AppDir structure
+      run: |
+        mkdir -p AppDir/usr/bin
+        mkdir -p AppDir/usr/lib/python3.8
+        mkdir -p AppDir/usr/share/applications
+        mkdir -p AppDir/usr/share/icons/hicolor/512x512/apps
+
+    - name: Install dependencies in AppDir
+      run: |
+        # Download and extract Python 3.8 (old enough for old Debian)
+        wget https://www.python.org/ftp/python/3.8.18/Python-3.8.18.tgz
+        tar -xzf Python-3.8.18.tgz
+        cd Python-3.8.18
+        ./configure --prefix=/usr --enable-shared --with-system-expat --with-system-ffi
+        make -j$(nproc)
+        make install DESTDIR=$GITHUB_WORKSPACE/AppDir/usr
+        cd ..
+
+        # Copy Python libraries
+        cp -r Python-3.8.18/Lib $GITHUB_WORKSPACE/AppDir/usr/lib/python3.8/
+        cp Python-3.8.18/libpython3.8.so* $GITHUB_WORKSPACE/AppDir/usr/lib/
+
+    - name: Download and build ffmpeg
+      run: |
+        cd $GITHUB_WORKSPACE
+        wget https://ffmpeg.org/releases/ffmpeg-4.4.tar.xz
+        tar -xf ffmpeg-4.4.tar.xz
+        cd ffmpeg-4.4
+        ./configure --prefix=/usr --disable-doc --disable-network --enable-static --disable-shared --disable-debug --disable-ffplay --disable-ffprobe --disable-ffmpeg --enable-gpl --enable-nonfree --enable-small --disable- everything --enable-decoder=h264 --enable-decoder=srt --enable-parser=srt --enable-demuxer=srt --enable-muxer=srt
+        make -j$(nproc)
+        make install DESTDIR=$GITHUB_WORKSPACE/AppDir/usr
+
+    - name: Build ffsubsync
+      run: |
+        cd $GITHUB_WORKSPACE
+        git clone https://github.com/smacke/ffsubsync.git
+        cd ffsubsync
+        # Copy ffsubsync to AppDir
+        cp ffsubsync $GITHUB_WORKSPACE/AppDir/usr/bin/
+        chmod +x $GITHUB_WORKSPACE/AppDir/usr/bin/ffsubsync
+
+    - name: Install Tkinter and dependencies
+      run: |
+        # Copy tkinter from Python build
+        cp -r Python-3.8.18/lib/python3.8/tkinter $GITHUB_WORKSPACE/AppDir/usr/lib/python3.8/
+        cp -r Python-3.8.18/lib/python3.8/lib-dynload $GITHUB_WORKSPACE/AppDir/usr/lib/python3.8/
+        
+        # Copy required system libs for tkinter
+        ldd /usr/lib/x86_64-linux-gnu/libtk8.6.so | grep "=> /" | awk '{print $3}' | while read lib; do
+          dir=$(dirname "$lib")
+          mkdir -p $GITHUB_WORKSPACE/AppDir$dir
+          cp "$lib" $GITHUB_WORKSPACE/AppDir$dir/
+        done
+
+    - name: Copy GUI script
+      run: |
+        cp ffsubsync_gui.py $GITHUB_WORKSPACE/AppDir/ffsubsync_gui.py
+        chmod +x $GITHUB_WORKSPACE/AppDir/ffsubsync_gui.py
+
+    - name: Create AppRun
+      run: |
+        cat > $GITHUB_WORKSPACE/AppDir/AppRun << 'EOF'
+        #!/bin/bash
+        HERE="$(dirname "$(readlink -f "${0}")")"
+        
+        # Set library paths
+        export LD_LIBRARY_PATH="$HERE/usr/lib:$HERE/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
+        export PATH="$HERE/usr/bin:$PATH"
+        export PYTHONHOME="$HERE/usr"
+        export PYTHONPATH="$HERE/usr/lib/python3.8:$HERE/usr/lib/python3.8/lib-dynload:$PYTHONPATH"
+        
+        # Run the GUI
+        exec "$HERE/usr/bin/python3" "$HERE/ffsubsync_gui.py" "$@"
+        EOF
+        chmod +x $GITHUB_WORKSPACE/AppDir/AppRun
+
+    - name: Create .desktop file
+      run: |
+        cat > $GITHUB_WORKSPACE/AppDir/ffsubsync.desktop << 'EOF'
+        [Desktop Entry]
+        Name=FFsubsync GUI
+        Comment=Subtitle synchronization tool
+        Exec=AppRun
+        Icon=ffsubsync
+        Terminal=false
+        Type=Application
+        Categories=AudioVideo;
+        EOF
+        
+        # Download icon
+        wget -O $GITHUB_WORKSPACE/AppDir/usr/share/icons/hicolor/512x512/apps/ffsubsync.png \
+          https://raw.githubusercontent.com/smacke/ffsubsync/master/doc/ffsubsync.png 2>/dev/null || \
+          echo "Icon download failed, using placeholder"
+
+    - name: Download linuxdeploy
+      run: |
+        wget https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+        chmod +x linuxdeploy-x86_64.AppImage
+
+    - name: Bundle extra libraries
+      run: |
+        # Find and copy all required libraries
+        cd $GITHUB_WORKSPACE/AppDir/usr/bin
+        
+        # Bundle libraries for python3
+        for bin in python3; do
+          ldd $bin | grep "=> /" | awk '{print $3}' | while read lib; do
+            libname=$(basename "$lib")
+            if [[ ! -f "$GITHUB_WORKSPACE/AppDir/usr/lib/$libname" ]] && [[ ! -f "$GITHUB_WORKSPACE/AppDir/usr/lib/x86_64-linux-gnu/$libname" ]]; then
+              mkdir -p $GITHUB_WORKSPACE/AppDir/usr/lib/x86_64-linux-gnu
+              cp "$lib" $GITHUB_WORKSPACE/AppDir/usr/lib/x86_64-linux-gnu/
+            fi
+          done
+        done
+        
+        # Bundle libraries for tkinter
+        for lib in libtk8.6.so libtcl8.6.so; do
+          ldd $(find /usr/lib -name "$lib" 2>/dev/null | head -1) 2>/dev/null | grep "=> /" | awk '{print $3}' | while read dep; do
+            depname=$(basename "$dep")
+            if [[ ! -f "$GITHUB_WORKSPACE/AppDir/usr/lib/$depname" ]]; then
+              mkdir -p $GITHUB_WORKSPACE/AppDir/usr/lib
+              cp "$dep" $GITHUB_WORKSPACE/AppDir/usr/lib/
+            fi
+          done
+        done
+
+    - name: Create AppImage
+      run: |
+        cd $GITHUB_WORKSPACE
+        
+        # Set architecture
+        export ARCH=x86_64
+        
+        # Create AppImage
+        ./linuxdeploy-x86_64.AppImage \
+          --appdir AppDir \
+          --output appimage \
+          --desktop-file AppDir/ffsubsync.desktop \
+          --icon-file AppDir/usr/share/icons/hicolor/512x512/apps/ffsubsync.png \
+          --plugin qt \
+          --custom-apprun AppDir/AppRun
+
+    - name: Make AppImage executable
+      run: |
+        chmod +x FFsubsync-GUI-*.AppImage
+
+    - name: Upload AppImage
+      uses: actions/upload-artifact@v3
+      with:
+        name: ffsubsync-gui
+        path: FFsubsync-GUI-*.AppImage
+
+    - name: Create Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: FFsubsync-GUI-*.AppImage
